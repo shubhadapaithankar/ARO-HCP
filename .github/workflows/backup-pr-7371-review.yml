@@ -15,7 +15,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.work
-          cache: false
+          cache: true
+          cache-dependency-path: '**/go.sum'
       - name: Install repository-pinned rule tools
         shell: bash
         run: |
@@ -29,6 +30,13 @@ jobs:
           echo "$PWD/.review-7371/tools" >> "$GITHUB_PATH"
           az bicep install --version "v${bv}"
           python3 -m pip install 'ruamel.yaml==0.18.10'
+      - name: Snapshot source and promtool for local review
+        run: tar --exclude=.git -czf /tmp/backup-review-input.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backup-pr-7371-input
+          path: /tmp/backup-review-input.tgz
+          retention-days: 3
       - name: Apply isolated review patch when present
         shell: bash
         run: |
