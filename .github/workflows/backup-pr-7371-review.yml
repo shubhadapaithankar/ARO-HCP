@@ -1,0 +1,74 @@
+name: Backup PR 7371 review validation
+on:
+  push:
+    branches: [shpaitha/backup-review-validation-7371]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+          cache: false
+      - name: Install repository-pinned rule tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .review-7371/tools
+          pv=$(awk '/^PROMTOOL_VERSION/{print $3}' dev-infrastructure/openshift-ci/versions.mk)
+          bv=$(awk '/^BICEP_VERSION/{print $3}' dev-infrastructure/openshift-ci/versions.mk)
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${pv}/prometheus-${pv}.linux-amd64.tar.gz" -o /tmp/prometheus.tgz
+          tar -xzf /tmp/prometheus.tgz -C /tmp "prometheus-${pv}.linux-amd64/promtool"
+          cp "/tmp/prometheus-${pv}.linux-amd64/promtool" .review-7371/tools/promtool
+          echo "$PWD/.review-7371/tools" >> "$GITHUB_PATH"
+          az bicep install --version "v${bv}"
+          python3 -m pip install 'ruamel.yaml==0.18.10'
+      - name: Apply isolated review patch when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f .review-7371/apply.py; then python3 .review-7371/apply.py; fi
+      - name: Generate and test alert rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C observability alerts 2>&1 | tee /tmp/backup-review-alerts.log
+      - name: Generate and test recording rules
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C observability recording-rules 2>&1 | tee /tmp/backup-review-recording.log
+      - name: Regenerate and check the diagnostic corpus
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd test
+          UPDATE=1 go test ./util/alertdiagnostics -run '^TestRepositoryCorpus$' -count=1
+          go test ./util/alertdiagnostics ./cmd/aro-hcp-tests/gather-observability
+          cd ..
+          git diff --check
+          git diff --stat
+      - name: Save review workspace and logs
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/backup-review-result
+          git diff --binary > /tmp/backup-review-result/changes.patch
+          git status --short > /tmp/backup-review-result/status.txt
+          cp /tmp/backup-review-*.log /tmp/backup-review-result/ 2>/dev/null || true
+          tar --exclude=.git -czf /tmp/backup-review-result/workspace.tgz .
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: backup-pr-7371-validation
+          path: /tmp/backup-review-result/
+          retention-days: 3
