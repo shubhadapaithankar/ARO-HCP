@@ -7,7 +7,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,18 +30,16 @@ jobs:
           echo "$PWD/.review-7371/tools" >> "$GITHUB_PATH"
           az bicep install --version "v${bv}"
           python3 -m pip install 'ruamel.yaml==0.18.10'
-      - name: Snapshot source and promtool for local review
-        run: tar --exclude=.git -czf /tmp/backup-review-input.tgz .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: backup-pr-7371-input
-          path: /tmp/backup-review-input.tgz
-          retention-days: 3
-      - name: Apply isolated review patch when present
+          GOBIN="$PWD/.review-7371/tools" go install github.com/google/yamlfmt/cmd/yamlfmt@v0.16.0
+      - name: Apply isolated review implementation
+        run: python3 .review-7371/apply.py
+      - name: Format scoped source and test generator
         shell: bash
         run: |
           set -euo pipefail
-          if test -f .review-7371/apply.py; then python3 .review-7371/apply.py; fi
+          gofmt -w tooling/prometheus-rules/internal/generator.go tooling/prometheus-rules/internal/generator_test.go
+          yamlfmt observability/alerts/backup-slo-prometheusRule.yaml observability/alerts/backup-slo-prometheusRule_test.yaml observability/recording-rules/backup-slo-recordingRule.yaml observability/recording-rules/backup-slo-recordingRule_test.yaml
+          go test ./tooling/prometheus-rules/... 2>&1 | tee /tmp/backup-review-generator.log
       - name: Generate and test alert rules
         shell: bash
         run: |
@@ -53,17 +51,18 @@ jobs:
         run: |
           set -euo pipefail
           make -C observability recording-rules 2>&1 | tee /tmp/backup-review-recording.log
-      - name: Regenerate and check the diagnostic corpus
-        if: ${{ success() }}
+      - name: Regenerate and check diagnostic corpus
         shell: bash
         run: |
           set -euo pipefail
-          cd test
-          UPDATE=1 go test ./util/alertdiagnostics -run '^TestRepositoryCorpus$' -count=1
-          go test ./util/alertdiagnostics ./cmd/aro-hcp-tests/gather-observability
-          cd ..
+          (cd test && UPDATE=1 go test ./util/alertdiagnostics -run '^TestRepositoryCorpus$' -count=1 && go test ./util/alertdiagnostics ./cmd/aro-hcp-tests/gather-observability) 2>&1 | tee /tmp/backup-review-corpus.log
           git diff --check
           git diff --stat
+      - name: Check runbook redirect without changing it
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          curl --max-time 20 -sS -L -o /dev/null -w 'runbook_http_status=%{http_code}\nrunbook_effective_url=%{url_effective}\n' https://aka.ms/arohcp-runbook-backup | tee /tmp/backup-review-runbook.log || true
       - name: Save review workspace and logs
         if: ${{ always() }}
         shell: bash
@@ -80,3 +79,53 @@ jobs:
           name: backup-pr-7371-validation
           path: /tmp/backup-review-result/
           retention-days: 3
+  prepare-reviewed-commit:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1528539bd922ef3f211d66deaf880505f2cf4e07
+      - uses: actions/download-artifact@v4
+        with:
+          name: backup-pr-7371-validation
+          path: /tmp/backup-review-result
+      - name: Prepare scoped commit without touching the PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            observability/alerts/backup-slo-prometheusRule.yaml
+            observability/alerts/backup-slo-prometheusRule_test.yaml
+            observability/recording-rules/backup-slo-recordingRule.yaml
+            observability/recording-rules/backup-slo-recordingRule_test.yaml
+            tooling/prometheus-rules/internal/generator.go
+            tooling/prometheus-rules/internal/generator_test.go
+            dev-infrastructure/modules/metrics/rules/generatedRPPrometheusAlertingRules.bicep
+            dev-infrastructure/modules/metrics/rules/generatedRecordingRules.bicep
+            test/util/alertdiagnostics/testdata/zz_fixture_TestRepositoryCorpus.yaml
+          )
+          printf '%s\n' "${files[@]}" | sort > /tmp/allowed-files.txt
+          git apply --stat /tmp/backup-review-result/changes.patch
+          python3 - <<'PY'
+          import pathlib
+          allowed = set(pathlib.Path('/tmp/allowed-files.txt').read_text().splitlines())
+          changes = pathlib.Path('/tmp/backup-review-result/status.txt').read_text().splitlines()
+          unexpected = [line for line in changes if not line.startswith('?? .review-7371/') and line[3:] not in allowed]
+          if unexpected:
+              raise SystemExit('Unexpected changed paths require review: ' + repr(unexpected))
+          PY
+          for path in "${files[@]}"; do
+            tar -xzf /tmp/backup-review-result/workspace.tgz -O "./$path" > "$path"
+          done
+          git diff --check
+          git diff --stat
+          git add -- "${files[@]}"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix(observability): address backup SLO review findings' -m 'Add replica-safe volume floors, observed-schedule missing-success detection, six-hour-cadence traffic handling, named regression and recovery tests, and corrected alert summaries/documentation. Regenerate deployment rules and diagnostic corpus using the repository make targets. SLO policy alignment and the approved runbook redirect remain prerequisites.'
+          branch="shpaitha/backup-reviewed-7371-${GITHUB_RUN_ID}"
+          git push origin "HEAD:refs/heads/$branch"
+          echo "RESULT_BRANCH=$branch"
+          echo "RESULT_COMMIT=$(git rev-parse HEAD)"
